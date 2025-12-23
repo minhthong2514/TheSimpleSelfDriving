@@ -8,7 +8,7 @@ import threading
 #      CONFIG
 # ========================
 
-ONNX_MODEL_PATH = "/home/minhthong/Desktop/code/self-driving/traffic_sign_model.onnx"
+ONNX_MODEL_PATH = "/home/jetson-nano/Desktop/code/Do_an_robot/src/traffic_sign_model.onnx"
 INPUT_SIZE = 640
 CONF_THRESH = 0.7
 IOU_THRESH = 0.45

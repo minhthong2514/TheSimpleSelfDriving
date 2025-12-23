@@ -5,7 +5,7 @@ import time
 
 # ======= Cấu hình =======
 ONNX_MODEL_PATH = "traffic_sign_model.onnx"  # đường dẫn ONNX
-IMG_PATH = "/home/minhthong/Desktop/code/self-driving/test_data/go_ahead1.jpeg"  # ảnh cần detect
+IMG_PATH = "/home/jetson-nano/Desktop/code/Do_an_robot/test_data/go_ahead1.jpeg"  # ảnh cần detect
 INPUT_SIZE = 640
 CONF_THRESH = 0.25
 IOU_THRESH = 0.45

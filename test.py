@@ -7,7 +7,7 @@ import os
 # ======= Cấu hình =======
 
 ONNX_MODEL_PATH = "traffic_sign_model.onnx"
-IMG_FOLDER = "/home/minhthong/Desktop/code/self-driving/test_data"
+IMG_FOLDER = "/home/jetson-nano/Desktop/code/Do_an_robot/test_data"
 INPUT_SIZE = 640
 CONF_THRESH = 0.25
 IOU_THRESH = 0.45
