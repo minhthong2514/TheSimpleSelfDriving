@@ -64,16 +64,40 @@ def preprocess_yolo(img):
 #         NMS
 # =========================
 
-def nms(boxes, scores):
+def nms(boxes, scores, iou_thresh=IOU_THRESH):
     if len(boxes) == 0:
         return []
 
-    idxs = cv2.dnn.NMSBoxes(
-        boxes, scores,
-        CONF_THRESH,
-        IOU_THRESH
-    )
-    return idxs.flatten() if len(idxs) > 0 else []
+    boxes = np.array(boxes)
+    scores = np.array(scores)
+
+    x1 = boxes[:, 0]
+    y1 = boxes[:, 1]
+    x2 = boxes[:, 0] + boxes[:, 2]
+    y2 = boxes[:, 1] + boxes[:, 3]
+
+    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+    order = scores.argsort()[::-1]
+
+    keep = []
+
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+
+        w = np.maximum(0, xx2 - xx1 + 1)
+        h = np.maximum(0, yy2 - yy1 + 1)
+        inter = w * h
+
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
+        order = order[1:][iou <= iou_thresh]
+
+    return keep
 
 # =========================
 #      LINE PROCESSING
@@ -91,9 +115,10 @@ def detect_line(frame):
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
 
-    contours, _ = cv2.findContours(
+    cnts = cv2.findContours(
         binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
+    contours = cnts[0] if len(cnts) == 2 else cnts[1]
 
     error = None
 
