@@ -7,14 +7,16 @@ import time
 #        CONFIG
 # =========================
 
-ONNX_MODEL_PATH = "traffic_sign_model.onnx"
+ONNX_MODEL_PATH = "/home/jetson-nano/Desktop/code/Do_an_robot/src/traffic_sign_model.onnx"
 INPUT_SIZE = 640
 
-CONF_THRESH = 0.7
+CONF_THRESH = 0.9
 IOU_THRESH = 0.45
 
 classes = ['go-ahead', 'stop', 'turn-around', 'turn-left', 'turn-right']
-
+line_detect = 0
+error = 0
+sign_id = -1
 # =========================
 #    LOAD ONNX (GPU/CPU)
 # =========================
@@ -106,34 +108,45 @@ def nms(boxes, scores, iou_thresh=IOU_THRESH):
 def detect_line(frame):
     h, w = frame.shape[:2]
 
-    roi = frame[int(h*0.6):h, :]
+    # ========================
+    # ROI: chỉ lấy phần dưới
+    # ========================
+    roi = frame[int(h * 0.5):h, :]
 
+    # ========================
+    # Gray + threshold cố định
+    # ========================
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 60, 255, cv2.THRESH_BINARY_INV)
+    _, binary = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY_INV)
 
-    kernel = np.ones((5,5), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    # ========================
+    # Morphology nhẹ
+    # ========================
+    kernel = np.ones((3, 3), np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
-    cnts = cv2.findContours(
-        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
+    # ========================
+    # Find contours
+    # ========================
+    cnts = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours = cnts[0] if len(cnts) == 2 else cnts[1]
 
     error = None
 
     if contours:
         largest = max(contours, key=cv2.contourArea)
-        M = cv2.moments(largest)
 
-        if M["m00"] != 0:
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
+        if cv2.contourArea(largest) > 500:  # lọc nhiễu nhỏ
+            M = cv2.moments(largest)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
 
-            cv2.circle(roi, (cx, cy), 5, (0,0,255), -1)
-            cv2.drawContours(roi, [largest], -1, (0,255,0), 2)
+                cv2.circle(roi, (cx, cy), 5, (0,255,0), -1)
+                cv2.drawContours(roi, [largest], -1, (0,255,0), 2)
 
-            error = cx - (w // 2)
+                error = cx - (w // 2)
 
     return error, roi, binary
 
@@ -158,7 +171,7 @@ print("===== START =====")
 # =========================
 
 last_yolo_time = 0
-YOLO_INTERVAL = 0.15   # YOLO chạy ~6–7 FPS
+YOLO_INTERVAL = 0.1   # YOLO chạy ~6–7 FPS
 
 while True:
     ret, frame = cap.read()
@@ -208,7 +221,7 @@ while True:
         if len(idxs) > 0:
             i = idxs[0]
             detected_sign = classes[class_ids[i]]
-
+            sign_id = detected_sign
             x,y,w,h = boxes[i]
             cv2.rectangle(frame, (x,y), (x+w,y+h), (255,0,0), 2)
             cv2.putText(frame, detected_sign,
@@ -249,7 +262,7 @@ while True:
 
     cv2.imshow("Autonomous Car", frame)
     cv2.imshow("Line Binary", binary)
-
+    print(line_detect, error, sign_id)
     if cv2.waitKey(1) & 0xFF == 27:
         break
 
