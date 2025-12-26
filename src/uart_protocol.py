@@ -9,6 +9,6 @@ class UART():
         self.sign_id = 0
 
     def send_uart(self, line_detect_mode, line_error, sign_id):
-        data_frame = struct.pack("<BBHB", self.HEADER, line_detect_mode, line_error, sign_id) 
+        data_frame = struct.pack("<Bbhb", self.HEADER, line_detect_mode, line_error, sign_id) 
         self.ser.write(data_frame)
 

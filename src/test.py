@@ -3,6 +3,12 @@ import time
 import threading
 import numpy as np
 import onnxruntime as ort
+from uart_protocol import UART
+import serial
+
+HEADER = 0xAA
+ser = serial.Serial(port='/dev/ttyUSB0', baudrate= 115200, timeout=1) 
+uart = UART(ser, HEADER)
 
 # ======================
 # Shared variables
@@ -139,7 +145,7 @@ def detect_line(frame):
     cnts = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours = cnts[0] if len(cnts) == 2 else cnts[1]
 
-    error = None
+    error = 0
 
     if contours:
         largest = max(contours, key=cv2.contourArea)
@@ -159,8 +165,8 @@ def detect_line(frame):
     return error, roi, binary
 
 def process_thread(cap):
-    global shared_frame, shared_binary
-    global sign_id, line_detect_mode, error, running
+    global shared_frame, sign_id, line_detect_mode, running
+
 
     last_yolo_time = 0
     YOLO_INTERVAL = 0.1  # ~10 FPS
@@ -170,7 +176,7 @@ def process_thread(cap):
         if not ret:
             continue
 
-        current_time = time.time()
+        current_time = time.time() 
 
         # ========================
         # YOLO SIGN DETECTION
@@ -193,7 +199,7 @@ def process_thread(cap):
                 class_probs = det[5:]
                 cid = int(np.argmax(class_probs))
                 score = conf * class_probs[cid]
-                if score < 0.4:
+                if score < CONF_THRESH:
                     continue
 
                 cx, cy, w, h = det[:4]
@@ -224,21 +230,33 @@ def process_thread(cap):
                     line_detect_mode = 0
                 elif detected_sign == 'go-ahead':
                     line_detect_mode = 1
-            info = f"MODE: {line_detect_mode} | ERROR: {error} | SIGN: {sign_id}"
-            print(info)
-            last_yolo_time = current_time
 
-        # ========================
-        # LINE DETECTION (ALWAYS)
-        # ========================
-        error, roi, binary = detect_line(frame)
+            last_yolo_time = current_time
 
         # ========================
         # UPDATE SHARED FRAME
         # ========================
+        # ===== SHARE FRAME =====
         with frame_lock:
             shared_frame = frame.copy()
+
+
+def line_thread():
+    global shared_frame, shared_binary, error, running
+
+    while running:
+        with frame_lock:
+            if shared_frame is None:
+                continue
+            frame = shared_frame.copy()
+
+        err, roi, binary = detect_line(frame)
+
+        error = err
+        with frame_lock:
             shared_binary = binary.copy()
+
+
 
 def display_thread():
     global running
@@ -252,11 +270,11 @@ def display_thread():
             continue
 
         with frame_lock:
-            if shared_frame is None:
+            if shared_frame is None or shared_binary is None:
                 continue
             frame = shared_frame.copy()
             binary = shared_binary.copy()
-
+        
         cv2.imshow("Frame", frame)
         cv2.imshow("Line Binary", binary)
 
@@ -266,6 +284,28 @@ def display_thread():
 
     cv2.destroyAllWindows()
 
+def send_thread():
+    global running
+
+    SEND_INTERVAL = 0.1  # 20 Hz
+    last_send = 0
+
+    while running:
+        now = time.time()
+        if now - last_send < SEND_INTERVAL:
+            time.sleep(0.001)
+            continue
+
+        with frame_lock:
+            sid = sign_id
+            err = error
+            mode = line_detect_mode
+
+        uart.send_uart(mode, err, sid)
+        info = f"MODE: {mode} | ERROR: {err} | SIGN: {sid}"
+        print(info)
+        last_send = now
+
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -273,11 +313,17 @@ cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
 t1 = threading.Thread(target=process_thread, args=(cap,))
 t2 = threading.Thread(target=display_thread)
+t3 = threading.Thread(target=send_thread)
+t4 = threading.Thread(target=line_thread)
 
 t1.start()
 t2.start()
+t3.start()
+t4.start()
 
 t1.join()
 t2.join()
+t3.join()
+t4.join()
 
 cap.release()
