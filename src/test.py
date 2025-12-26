@@ -15,6 +15,7 @@ uart = UART(ser, HEADER)
 # ======================
 shared_frame = None
 shared_binary = None
+shared_roi = None
 
 frame_lock = threading.Lock()
 running = True
@@ -119,7 +120,7 @@ def detect_line(frame):
     roi = frame[int(h * 0.5):h, :]
 
     # ========================
-    # Tách màu đỏ (HSV)
+    # Divide red color (HSV)
     # ========================
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
@@ -164,7 +165,7 @@ def detect_line(frame):
 
     return error, roi, binary
 
-def process_thread(cap):
+def yolo_thread(cap):
     global shared_frame, sign_id, line_detect_mode, running
 
 
@@ -183,7 +184,7 @@ def process_thread(cap):
         # ========================
         if current_time - last_yolo_time > YOLO_INTERVAL:
 
-            sign_id = -1  # reset mỗi chu kỳ YOLO
+            detected_id = -1  # reset mỗi chu kỳ YOLO
 
             img_input, scale, pad_x, pad_y = preprocess_yolo(frame)
             outputs = session.run(None, {input_name: img_input})
@@ -214,8 +215,8 @@ def process_thread(cap):
 
             if len(idxs) > 0:
                 i = idxs[0]
-                sign_id = class_ids[i]
-                detected_sign = classes[sign_id]
+                detected_id = class_ids[i]
+                detected_sign = classes[detected_id]
 
                 x, y, w, h = boxes[i]
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
@@ -230,7 +231,8 @@ def process_thread(cap):
                     line_detect_mode = 0
                 elif detected_sign == 'go-ahead':
                     line_detect_mode = 1
-
+            
+            sign_id = detected_id
             last_yolo_time = current_time
 
         # ========================
@@ -242,7 +244,7 @@ def process_thread(cap):
 
 
 def line_thread():
-    global shared_frame, shared_binary, error, running
+    global shared_frame, shared_binary, shared_roi, error, running
 
     while running:
         with frame_lock:
@@ -253,10 +255,9 @@ def line_thread():
         err, roi, binary = detect_line(frame)
 
         error = err
-        with frame_lock:
+        with frame_lock:            
+            shared_roi = roi.copy()
             shared_binary = binary.copy()
-
-
 
 def display_thread():
     global running
@@ -270,13 +271,20 @@ def display_thread():
             continue
 
         with frame_lock:
-            if shared_frame is None or shared_binary is None:
+            if shared_frame is None or shared_roi is None:
                 continue
             frame = shared_frame.copy()
-            binary = shared_binary.copy()
-        
+            roi = shared_roi.copy()
+            binary = shared_binary.copy() if shared_binary is not None else None
+
+        h, w = frame.shape[:2]
+        y0 = int(h * 0.5)
+
+        frame[y0:y0 + roi.shape[0], :] = roi
+
         cv2.imshow("Frame", frame)
-        cv2.imshow("Line Binary", binary)
+        if binary is not None:
+            cv2.imshow("Line Binary", binary)
 
         if cv2.waitKey(1) & 0xFF == 27:
             running = False
@@ -284,10 +292,11 @@ def display_thread():
 
     cv2.destroyAllWindows()
 
+
 def send_thread():
     global running
 
-    SEND_INTERVAL = 0.1  # 20 Hz
+    SEND_INTERVAL = 0.1  # 10 Hz
     last_send = 0
 
     while running:
@@ -311,10 +320,10 @@ cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-t1 = threading.Thread(target=process_thread, args=(cap,))
-t2 = threading.Thread(target=display_thread)
-t3 = threading.Thread(target=send_thread)
-t4 = threading.Thread(target=line_thread)
+t1 = threading.Thread(target=yolo_thread, args=(cap,))
+t2 = threading.Thread(target=line_thread)
+t3 = threading.Thread(target=display_thread)
+t4 = threading.Thread(target=send_thread)
 
 t1.start()
 t2.start()
