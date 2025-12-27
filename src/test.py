@@ -6,333 +6,268 @@ import onnxruntime as ort
 from uart_protocol import UART
 import serial
 
+# ======================
+# UART
+# ======================
 HEADER = 0xAA
-ser = serial.Serial(port='/dev/ttyUSB0', baudrate= 115200, timeout=1) 
+ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
 uart = UART(ser, HEADER)
 
 # ======================
-# Shared variables
+# SHARED DATA
 # ======================
-shared_frame = None
-shared_binary = None
-shared_roi = None
+shared_frame = None          # frame gốc từ camera
+shared_yolo = None           # (box, class_id)
+shared_line = None           # (cx, cy, contour)
+error = 0
+
+sign_id = -1
+line_detect_mode = 0
 
 frame_lock = threading.Lock()
 running = True
 
-
+# ======================
+# YOLO CONFIG
+# ======================
 ONNX_MODEL_PATH = "/home/jetson-nano/Desktop/code/Do_an_robot/src/traffic_sign_model.onnx"
 INPUT_SIZE = 640
-
 CONF_THRESH = 0.9
 IOU_THRESH = 0.45
-
 classes = ['go-ahead', 'stop', 'turn-around', 'turn-left', 'turn-right']
-line_detect_mode = 0
-error = 0
-sign_id = -1
-# =========================
-#    LOAD ONNX (GPU/CPU)
-# =========================
 
+# ======================
+# LOAD YOLO
+# ======================
 providers = ort.get_available_providers()
-print("Available providers:", providers)
-
-if "CUDAExecutionProvider" in providers:
-    session = ort.InferenceSession(
-        ONNX_MODEL_PATH,
-        providers=["CUDAExecutionProvider"]
-    )
-    print(">>> Using GPU for YOLO")
-else:
-    session = ort.InferenceSession(
-        ONNX_MODEL_PATH,
-        providers=["CPUExecutionProvider"]
-    )
-    print(">>> Using CPU for YOLO")
-
+provider = "CUDAExecutionProvider" if "CUDAExecutionProvider" in providers else "CPUExecutionProvider"
+session = ort.InferenceSession(ONNX_MODEL_PATH, providers=[provider])
 input_name = session.get_inputs()[0].name
 
-# =========================
-#       PREPROCESS
-# =========================
-
+# ======================
+# PREPROCESS YOLO
+# ======================
 def preprocess_yolo(img):
     h, w = img.shape[:2]
     scale = INPUT_SIZE / max(h, w)
     nh, nw = int(h * scale), int(w * scale)
 
-    img_resized = cv2.resize(img, (nw, nh))
+    resized = cv2.resize(img, (nw, nh))
+    canvas = np.full((INPUT_SIZE, INPUT_SIZE, 3), 114, np.uint8)
 
-    pad_x = (INPUT_SIZE - nw) // 2
-    pad_y = (INPUT_SIZE - nh) // 2
+    px, py = (INPUT_SIZE - nw)//2, (INPUT_SIZE - nh)//2
+    canvas[py:py+nh, px:px+nw] = resized
 
-    canvas = np.full((INPUT_SIZE, INPUT_SIZE, 3), 114, dtype=np.uint8)
-    canvas[pad_y:pad_y+nh, pad_x:pad_x+nw] = img_resized
+    img = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    img = np.transpose(img, (2,0,1))[None]
+    return img, scale, px, py
 
-    img_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    img_rgb = np.transpose(img_rgb, (2,0,1))
-    img_rgb = np.expand_dims(img_rgb, axis=0)
-
-    return img_rgb, scale, pad_x, pad_y
-
-# =========================
-#         NMS
-# =========================
-
-def nms(boxes, scores, iou_thresh=IOU_THRESH):
-    if len(boxes) == 0:
+# ======================
+# NMS
+# ======================
+def nms(boxes, scores):
+    if not boxes:
         return []
 
     boxes = np.array(boxes)
     scores = np.array(scores)
 
-    x1 = boxes[:, 0]
-    y1 = boxes[:, 1]
-    x2 = boxes[:, 0] + boxes[:, 2]
-    y2 = boxes[:, 1] + boxes[:, 3]
-
-    areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+    x1, y1 = boxes[:,0], boxes[:,1]
+    x2, y2 = x1+boxes[:,2], y1+boxes[:,3]
+    areas = (x2-x1+1)*(y2-y1+1)
     order = scores.argsort()[::-1]
 
     keep = []
-
-    while order.size > 0:
+    while order.size:
         i = order[0]
         keep.append(i)
-
         xx1 = np.maximum(x1[i], x1[order[1:]])
         yy1 = np.maximum(y1[i], y1[order[1:]])
         xx2 = np.minimum(x2[i], x2[order[1:]])
         yy2 = np.minimum(y2[i], y2[order[1:]])
-
-        w = np.maximum(0, xx2 - xx1 + 1)
-        h = np.maximum(0, yy2 - yy1 + 1)
-        inter = w * h
-
-        iou = inter / (areas[i] + areas[order[1:]] - inter)
-        order = order[1:][iou <= iou_thresh]
+        w = np.maximum(0, xx2-xx1+1)
+        h = np.maximum(0, yy2-yy1+1)
+        iou = (w*h)/(areas[i]+areas[order[1:]]-w*h)
+        order = order[1:][iou <= IOU_THRESH]
 
     return keep
 
+# ======================
+# LINE DETECTION (NO DRAW)
+# ======================
 def detect_line(frame):
     h, w = frame.shape[:2]
-    roi = frame[int(h * 0.5):h, :]
+    roi = frame[int(h*0.5):h, :]
 
-    # ========================
-    # Divide red color (HSV)
-    # ========================
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-    lower_red1 = np.array([0, 80, 80])
-    upper_red1 = np.array([10, 255, 255])
-    lower_red2 = np.array([170, 80, 80])
-    upper_red2 = np.array([180, 255, 255])
+    mask = cv2.inRange(hsv, (0,80,80), (10,255,255)) | \
+           cv2.inRange(hsv, (170,80,80), (180,255,255))
 
-    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-    binary = mask1 | mask2
+    kernel = np.ones((3,3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-    # ========================
-    # Morphology
-    # ========================
-    kernel = np.ones((3, 3), np.uint8)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-    # ========================
-    # Find contours
-    # ========================
-    cnts = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cnts = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours = cnts[0] if len(cnts) == 2 else cnts[1]
 
-    error = 0
+    err = 0
+    result = None
 
     if contours:
-        largest = max(contours, key=cv2.contourArea)
-
-        if cv2.contourArea(largest) > 500:
-            M = cv2.moments(largest)
+        c = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(c) > 500:
+            M = cv2.moments(c)
             if M["m00"] != 0:
-                cx = int(M["m10"] / M["m00"])
-                cy = int(M["m01"] / M["m00"])
+                cx = int(M["m10"]/M["m00"])
+                cy = int(M["m01"]/M["m00"])
+                err = cx - w//2
+                result = (cx, cy + int(h*0.5), c)
 
-                cv2.circle(roi, (cx, cy), 5, (0,255,0), -1)
-                cv2.drawContours(roi, [largest], -1, (0,255,0), 2)
+    return err, result
 
-                error = cx - (w // 2)
-
-
-    return error, roi, binary
-
-def yolo_thread(cap):
-    global shared_frame, sign_id, line_detect_mode, running
-
-
-    last_yolo_time = 0
-    YOLO_INTERVAL = 0.1  # ~10 FPS
-
+# ======================
+# CAMERA THREAD
+# ======================
+def camera_thread(cap):
+    global shared_frame
     while running:
         ret, frame = cap.read()
         if not ret:
             continue
-
-        current_time = time.time() 
-
-        # ========================
-        # YOLO SIGN DETECTION
-        # ========================
-        if current_time - last_yolo_time > YOLO_INTERVAL:
-
-            detected_id = -1  # reset mỗi chu kỳ YOLO
-
-            img_input, scale, pad_x, pad_y = preprocess_yolo(frame)
-            outputs = session.run(None, {input_name: img_input})
-            preds = outputs[0][0]
-
-            boxes, scores, class_ids = [], [], []
-
-            for det in preds:
-                conf = det[4]
-                if conf < CONF_THRESH:
-                    continue
-
-                class_probs = det[5:]
-                cid = int(np.argmax(class_probs))
-                score = conf * class_probs[cid]
-                if score < CONF_THRESH:
-                    continue
-
-                cx, cy, w, h = det[:4]
-                x1 = int((cx - w/2 - pad_x) / scale)
-                y1 = int((cy - h/2 - pad_y) / scale)
-
-                boxes.append([x1, y1, int(w/scale), int(h/scale)])
-                scores.append(score)
-                class_ids.append(cid)
-
-            idxs = nms(boxes, scores)
-
-            if len(idxs) > 0:
-                i = idxs[0]
-                detected_id = class_ids[i]
-                detected_sign = classes[detected_id]
-
-                x, y, w, h = boxes[i]
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                cv2.putText(frame, str(detected_sign),
-                        (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8, (255, 0, 0), 2)
-                # ========================
-                # MODE LOGIC
-                # ========================
-                if detected_sign in ['stop', 'turn-left', 'turn-right', 'turn-around']:
-                    line_detect_mode = 0
-                elif detected_sign == 'go-ahead':
-                    line_detect_mode = 1
-            
-            sign_id = detected_id
-            last_yolo_time = current_time
-
-        # ========================
-        # UPDATE SHARED FRAME
-        # ========================
-        # ===== SHARE FRAME =====
         with frame_lock:
-            shared_frame = frame.copy()
+            shared_frame = frame
 
+# ======================
+# YOLO THREAD (NO DRAW)
+# ======================
+def yolo_thread():
+    global sign_id, line_detect_mode, shared_yolo
+    last = 0
+    while running:
+        if time.time() - last < 0.1:
+            time.sleep(0.001)
+            continue
 
+        with frame_lock:
+            if shared_frame is None:
+                continue
+            frame = shared_frame.copy()
+
+        img, scale, px, py = preprocess_yolo(frame)
+        preds = session.run(None, {input_name: img})[0][0]
+
+        boxes, scores, ids = [], [], []
+        for det in preds:
+            conf = det[4]
+            if conf < CONF_THRESH:
+                continue
+            cid = np.argmax(det[5:])
+            score = conf * det[5+cid]
+            if score < CONF_THRESH:
+                continue
+
+            cx,cy,w,h = det[:4]
+            x1 = int((cx-w/2-px)/scale)
+            y1 = int((cy-h/2-py)/scale)
+            boxes.append([x1,y1,int(w/scale),int(h/scale)])
+            scores.append(score)
+            ids.append(cid)
+
+        keep = nms(boxes, scores)
+
+        if keep:
+            i = keep[0]
+            sign_id = ids[i]
+            shared_yolo = (boxes[i], sign_id)
+
+            if classes[sign_id] == 'go-ahead':
+                line_detect_mode = 1
+            else:
+                line_detect_mode = 0
+        else:
+            sign_id = -1
+            shared_yolo = None
+
+        last = time.time()
+
+# ======================
+# LINE THREAD
+# ======================
 def line_thread():
-    global shared_frame, shared_binary, shared_roi, error, running
-
+    global error, shared_line
     while running:
         with frame_lock:
             if shared_frame is None:
                 continue
             frame = shared_frame.copy()
 
-        err, roi, binary = detect_line(frame)
-
+        err, result = detect_line(frame)
         error = err
-        with frame_lock:            
-            shared_roi = roi.copy()
-            shared_binary = binary.copy()
+        shared_line = result
 
+# ======================
+# DISPLAY THREAD (ONLY DRAW HERE)
+# ======================
 def display_thread():
     global running
-
-    skip = 0
-
     while running:
-        skip += 1
-        if skip % 2 != 0:
-            time.sleep(0.005)
-            continue
-
         with frame_lock:
-            if shared_frame is None or shared_roi is None:
+            if shared_frame is None:
                 continue
             frame = shared_frame.copy()
-            roi = shared_roi.copy()
-            binary = shared_binary.copy() if shared_binary is not None else None
+            yolo = shared_yolo
+            line = shared_line
 
-        h, w = frame.shape[:2]
-        y0 = int(h * 0.5)
+        # Draw YOLO
+        if yolo is not None:
+            (x,y,w,h), sid = yolo
+            cv2.rectangle(frame, (x,y), (x+w,y+h), (255,0,0), 2)
+            cv2.putText(frame, classes[sid], (x,y-5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,0), 2)
 
-        frame[y0:y0 + roi.shape[0], :] = roi
+        # Draw LINE
+        if line is not None:
+            cx, cy, contour = line
+            cv2.circle(frame, (cx,cy), 5, (0,255,0), -1)
+            cv2.drawContours(frame, [contour + [0,int(frame.shape[0]*0.5)]], -1, (0,255,0), 2)
 
         cv2.imshow("Frame", frame)
-        if binary is not None:
-            cv2.imshow("Line Binary", binary)
-
-        if cv2.waitKey(1) & 0xFF == 27:
+        if cv2.waitKey(1) == 27:
             running = False
             break
 
     cv2.destroyAllWindows()
 
-
+# ======================
+# SEND UART THREAD
+# ======================
 def send_thread():
-    global running
-
-    SEND_INTERVAL = 0.1  # 10 Hz
-    last_send = 0
-
+    last = 0
     while running:
-        now = time.time()
-        if now - last_send < SEND_INTERVAL:
-            time.sleep(0.001)
+        if time.time() - last < 0.05:
             continue
+        uart.send_uart(line_detect_mode, error, sign_id)
+        print(f"MODE:{line_detect_mode} ERR:{error} SIGN:{sign_id}")
+        last = time.time()
 
-        with frame_lock:
-            sid = sign_id
-            err = error
-            mode = line_detect_mode
-
-        uart.send_uart(mode, err, sid)
-        info = f"MODE: {mode} | ERROR: {err} | SIGN: {sid}"
-        print(info)
-        last_send = now
-
+# ======================
+# MAIN
+# ======================
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-t1 = threading.Thread(target=yolo_thread, args=(cap,))
-t2 = threading.Thread(target=line_thread)
-t3 = threading.Thread(target=display_thread)
-t4 = threading.Thread(target=send_thread)
+threads = [
+    threading.Thread(target=camera_thread, args=(cap,), daemon=True),
+    threading.Thread(target=yolo_thread, daemon=True),
+    threading.Thread(target=line_thread, daemon=True),
+    threading.Thread(target=display_thread, daemon=True),
+    threading.Thread(target=send_thread, daemon=True),
+]
 
-t1.start()
-t2.start()
-t3.start()
-t4.start()
-
-t1.join()
-t2.join()
-t3.join()
-t4.join()
+for t in threads: t.start()
+for t in threads: t.join()
 
 cap.release()
