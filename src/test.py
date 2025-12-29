@@ -13,6 +13,15 @@ HEADER = 0xAA
 ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
 uart = UART(ser, HEADER)
 
+
+STATE_LINE_FOLLOW = 0
+STATE_TURN_LEFT   = 1
+STATE_TURN_RIGHT  = 2
+STATE_TURN_AROUND = 3
+STATE_STOP        = 4
+
+robot_state = STATE_LINE_FOLLOW
+
 # ======================
 # SHARED DATA
 # ======================
@@ -32,7 +41,7 @@ running = True
 # ======================
 ONNX_MODEL_PATH = "/home/jetson-nano/Desktop/code/Do_an_robot/src/traffic_sign_model.onnx"
 INPUT_SIZE = 640
-CONF_THRESH = 0.9
+CONF_THRESH = 0.6
 IOU_THRESH = 0.45
 classes = ['go-ahead', 'stop', 'turn-around', 'turn-left', 'turn-right']
 
@@ -97,9 +106,8 @@ def nms(boxes, scores):
 # ======================
 def detect_line(frame):
     h, w = frame.shape[:2]
-    roi = frame[int(h*0.5):h, :]
 
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
     mask = cv2.inRange(hsv, (0,80,80), (10,255,255)) | \
            cv2.inRange(hsv, (170,80,80), (180,255,255))
@@ -119,12 +127,13 @@ def detect_line(frame):
         if cv2.contourArea(c) > 500:
             M = cv2.moments(c)
             if M["m00"] != 0:
-                cx = int(M["m10"]/M["m00"])
-                cy = int(M["m01"]/M["m00"])
-                err = cx - w//2
-                result = (cx, cy + int(h*0.5), c)
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                err = cx - w // 2
+                result = (cx, cy, c)
 
     return err, result
+
 
 # ======================
 # CAMERA THREAD
@@ -141,8 +150,22 @@ def camera_thread(cap):
 # ======================
 # YOLO THREAD (NO DRAW)
 # ======================
+# ====================== GLOBAL STATE ======================
+turn_state = {
+    "phase": None,      # None, wait_before_rotate, rotating, wait_after_cross, finished
+    "label": None,      # loại biển đang xử lý
+    "turn_start_time": None,
+    "stop_time": None
+}
+prev_error = None       # line error trước đó
+TURN_WAIT_TIME = 1.5    # giây dừng trước khi quay
+STOP_AFTER_CROSS = 1.5  # giây dừng sau khi zero-cross
+LINE_CENTER_THRESHOLD = 50  # px gần tâm ảnh để bật lại line
+
+# ====================== YOLO THREAD (CẬP NHẬT LOGIC BIỂN BÁO) ======================
 def yolo_thread():
     global sign_id, line_detect_mode, shared_yolo
+    global turn_state, prev_error
     last = 0
     while running:
         if time.time() - last < 0.1:
@@ -154,6 +177,7 @@ def yolo_thread():
                 continue
             frame = shared_frame.copy()
 
+        # ====================== YOLO INFERENCE ======================
         img, scale, px, py = preprocess_yolo(frame)
         preds = session.run(None, {input_name: img})[0][0]
 
@@ -176,26 +200,74 @@ def yolo_thread():
 
         keep = nms(boxes, scores)
 
+        # ====================== XỬ LÝ BIỂN BÁO ======================
         if keep:
             i = keep[0]
             sign_id = ids[i]
             shared_yolo = (boxes[i], sign_id)
+            label = classes[sign_id]
 
-            if classes[sign_id] == 'go-ahead':
+            if label == 'go-ahead':
                 line_detect_mode = 1
+                turn_state = {"phase": None, "label": None, "turn_start_time": None, "stop_time": None}
+                prev_error = None
+
+            elif label in ['turn-left', 'turn-right', 'turn-around']:
+                # Nếu mới thấy biển báo quay và chưa xử lý
+                if turn_state["phase"] is None:
+                    line_detect_mode = 0
+                    turn_state["phase"] = "wait_before_rotate"
+                    turn_state["label"] = label
+                    turn_state["turn_start_time"] = time.time()
+                    prev_error = None
+
             else:
                 line_detect_mode = 0
+
         else:
             sign_id = -1
             shared_yolo = None
 
+        # ====================== TURN STATE MACHINE ======================
+        if turn_state["phase"] == "wait_before_rotate":
+            # Chờ tạm trước khi quay
+            if time.time() - turn_state["turn_start_time"] >= TURN_WAIT_TIME:
+                turn_state["phase"] = "rotating"
+
+        elif turn_state["phase"] == "rotating":
+            if shared_line is not None:
+                cx, _, _ = shared_line
+                w = frame.shape[1]
+                err = cx - w//2
+
+                if prev_error is not None:
+                    if prev_error * err < 0:  # zero-cross detected
+                        turn_state["phase"] = "wait_after_cross"
+                        turn_state["stop_time"] = time.time()
+                        if turn_state["label"] == 'turn-around':
+                            sign_id = classes.index('stop')  # dừng hẳn
+                        else:
+                            sign_id = -1
+                prev_error = err
+            # Nếu line mất, giữ prev_error để phát hiện zero-cross
+
+        elif turn_state["phase"] == "wait_after_cross":
+            # Dừng sau khi zero-cross
+            if time.time() - turn_state["stop_time"] >= STOP_AFTER_CROSS:
+                if turn_state["label"] in ['turn-left', 'turn-right']:
+                    line_detect_mode = 1  # bật lại line PID
+                turn_state["phase"] = "finished"
+
         last = time.time()
+
+
 
 # ======================
 # LINE THREAD
 # ======================
 def line_thread():
-    global error, shared_line
+    global error, shared_line, robot_state
+
     while running:
         with frame_lock:
             if shared_frame is None:
@@ -203,8 +275,24 @@ def line_thread():
             frame = shared_frame.copy()
 
         err, result = detect_line(frame)
+
+        if result is None:
+            error = 0
+            shared_line = None
+            continue
+
         error = err
         shared_line = result
+
+        # ===== KẾT THÚC QUAY =====
+        if robot_state in (STATE_TURN_LEFT, STATE_TURN_RIGHT):
+            if abs(error) < 10:
+                robot_state = STATE_LINE_FOLLOW
+
+        elif robot_state == STATE_TURN_AROUND:
+            if abs(error) < 10:
+                robot_state = STATE_STOP
+
 
 # ======================
 # DISPLAY THREAD (ONLY DRAW HERE)
@@ -229,8 +317,9 @@ def display_thread():
         # Draw LINE
         if line is not None:
             cx, cy, contour = line
-            cv2.circle(frame, (cx,cy), 5, (0,255,0), -1)
-            cv2.drawContours(frame, [contour + [0,int(frame.shape[0]*0.5)]], -1, (0,255,0), 2)
+            cv2.circle(frame, (cx, cy), 5, (0,255,0), -1)
+            cv2.drawContours(frame, [contour], -1, (0,255,0), 2)
+
 
         cv2.imshow("Frame", frame)
         if cv2.waitKey(1) == 27:
@@ -242,14 +331,19 @@ def display_thread():
 # ======================
 # SEND UART THREAD
 # ======================
+# ====================== SEND THREAD ======================
 def send_thread():
     last = 0
     while running:
         if time.time() - last < 0.05:
             continue
+
+        # Gửi đến ESP
         uart.send_uart(line_detect_mode, error, sign_id)
         print(f"MODE:{line_detect_mode} ERR:{error} SIGN:{sign_id}")
+
         last = time.time()
+
 
 # ======================
 # MAIN
