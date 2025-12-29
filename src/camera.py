@@ -111,7 +111,7 @@ def detect_line(frame):
     # ========================
     # ROI: nửa dưới ảnh
     # ========================
-    roi = frame[int(h * 0.5):h, :]
+    roi = frame[int(h * 0.2):h, :]
 
     # ========================
     # Convert to HSV

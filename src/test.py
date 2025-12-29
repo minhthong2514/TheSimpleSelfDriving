@@ -6,6 +6,48 @@ import onnxruntime as ort
 from uart_protocol import UART
 import serial
 
+
+class TurnScript:
+    def __init__(self, turn_mode, final_stop):
+        self.turn_mode = turn_mode
+        self.final_stop = final_stop
+        self.step = 0
+        self.start_time = None
+        self.active = True
+
+    def update(self, line_error):
+        global mode
+
+        # STEP 0: STOP trước khi quay
+        if self.step == 0:
+            mode = MODE_STOP
+            if self.start_time is None:
+                self.start_time = time.time()
+            elif time.time() - self.start_time >= 3:
+                self.step = 1
+                self.start_time = None
+
+        # STEP 1: QUAY
+        elif self.step == 1:
+            mode = self.turn_mode
+            if abs(line_error) < 10:   # line về tâm
+                self.step = 2
+                self.start_time = None
+
+        # STEP 2: STOP sau khi quay
+        elif self.step == 2:
+            mode = MODE_STOP
+            if self.start_time is None:
+                self.start_time = time.time()
+            elif time.time() - self.start_time >= 3:
+                if self.final_stop:
+                    self.active = False   # đứng luôn
+                else:
+                    mode = MODE_TURN_AHEAD
+                    self.active = False
+
+current_script = None
+
 # ======================
 # UART
 # ======================
@@ -13,16 +55,16 @@ HEADER = 0xAA
 ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
 uart = UART(ser, HEADER)
 
-# ======================
-# ROBOT STATE
-# ======================
-STATE_LINE_FOLLOW = 0
-STATE_TURN_LEFT   = 1
-STATE_TURN_RIGHT  = 2
-STATE_TURN_AROUND = 3
-STATE_STOP        = 4
 
-robot_state = STATE_LINE_FOLLOW
+MODE_TURN_AHEAD = 0   # bám line
+MODE_STOP       = 1
+MODE_TURN_AROUND= 2
+MODE_TURN_LEFT  = 3
+MODE_TURN_RIGHT = 4
+
+
+mode = MODE_STOP      # mặc định khi bật nguồn
+sign_id = -1          # chỉ để debug
 
 # ======================
 # SHARED DATA
@@ -33,7 +75,7 @@ shared_line = None           # (cx, cy, contour)
 error = 0
 
 sign_id = -1
-line_detect_mode = 0  # ban đầu xe dừng
+line_detect_mode = 0
 
 frame_lock = threading.Lock()
 running = True
@@ -79,12 +121,15 @@ def preprocess_yolo(img):
 def nms(boxes, scores):
     if not boxes:
         return []
+
     boxes = np.array(boxes)
     scores = np.array(scores)
+
     x1, y1 = boxes[:,0], boxes[:,1]
     x2, y2 = x1+boxes[:,2], y1+boxes[:,3]
     areas = (x2-x1+1)*(y2-y1+1)
     order = scores.argsort()[::-1]
+
     keep = []
     while order.size:
         i = order[0]
@@ -97,33 +142,42 @@ def nms(boxes, scores):
         h = np.maximum(0, yy2-yy1+1)
         iou = (w*h)/(areas[i]+areas[order[1:]]-w*h)
         order = order[1:][iou <= IOU_THRESH]
+
     return keep
 
 # ======================
-# LINE DETECTION
+# LINE DETECTION (NO DRAW)
 # ======================
 def detect_line(frame):
     h, w = frame.shape[:2]
+
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
     mask = cv2.inRange(hsv, (0,80,80), (10,255,255)) | \
            cv2.inRange(hsv, (170,80,80), (180,255,255))
+
     kernel = np.ones((3,3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
     cnts = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours = cnts[0] if len(cnts)==2 else cnts[1]
+    contours = cnts[0] if len(cnts) == 2 else cnts[1]
+
     err = 0
     result = None
+
     if contours:
         c = max(contours, key=cv2.contourArea)
         if cv2.contourArea(c) > 500:
             M = cv2.moments(c)
             if M["m00"] != 0:
-                cx = int(M["m10"]/M["m00"])
-                cy = int(M["m01"]/M["m00"])
-                err = cx - w//2
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                err = cx - w // 2
                 result = (cx, cy, c)
+
     return err, result
+
 
 # ======================
 # CAMERA THREAD
@@ -137,100 +191,28 @@ def camera_thread(cap):
         with frame_lock:
             shared_frame = frame
 
-
 # ======================
-# TURN THREAD
+# YOLO THREAD (NO DRAW)
 # ======================
+# ====================== GLOBAL STATE ======================
 turn_state = {
-    "phase": None,         # None, wait_before_rotate, rotating, wait_after_cross, finished
-    "label": None,         # loại biển đang xử lý
+    "phase": None,      # None, wait_before_rotate, rotating, wait_after_cross, finished
+    "label": None,      # loại biển đang xử lý
     "turn_start_time": None,
-    "stop_start_time": None,
-    "prev_error": None
+    "stop_time": None
 }
+prev_error = None       # line error trước đó
+TURN_WAIT_TIME = 1.5    # giây dừng trước khi quay
+STOP_AFTER_CROSS = 1.5  # giây dừng sau khi zero-cross
+LINE_CENTER_THRESHOLD = 50  # px gần tâm ảnh để bật lại line
 
-TURN_WAIT_TIME = 3.0      # giây dừng trước khi quay
-STOP_AFTER_CROSS = 3.0    # giây dừng sau khi zero-cross / line về tâm
-
-def turn_thread():
-    global turn_state, line_detect_mode, shared_line, sign_id
-
-    while running:
-        if turn_state["phase"] is None:
-            time.sleep(0.01)
-            continue
-
-        current_time = time.time()
-
-        if turn_state["phase"] == "wait_before_rotate":
-            # Dừng xe trước khi quay
-            line_detect_mode = 0
-            # Giữ stop_start_time lúc bắt đầu dừng
-            if turn_state["stop_start_time"] is None:
-                turn_state["stop_start_time"] = current_time
-            # Nếu dừng đủ TURN_WAIT_TIME -> bắt đầu quay
-            if current_time - turn_state["stop_start_time"] >= TURN_WAIT_TIME:
-                turn_state["phase"] = "rotating"
-                turn_state["prev_error"] = None
-                turn_state["stop_start_time"] = None
-
-        elif turn_state["phase"] == "rotating":
-            # Giữ mode = 0 khi đang quay
-            line_detect_mode = 0
-            # sign_id luôn giữ biển đang quay
-            if turn_state["label"] is not None:
-                sign_id = classes.index(turn_state["label"])
-
-            if shared_line is not None:
-                cx, _, _ = shared_line
-                frame_width = 640  # hoặc lấy từ frame.shape[1] nếu có
-                err = cx - frame_width//2
-
-                # Turn-left / turn-right: kiểm tra zero-cross
-                if turn_state["label"] in ['turn-left', 'turn-right']:
-                    prev = turn_state["prev_error"]
-                    if prev is not None and prev * err < 0:  # zero-cross detected
-                        turn_state["phase"] = "wait_after_cross"
-                        turn_state["stop_start_time"] = current_time
-                    turn_state["prev_error"] = err
-
-                # Turn-around: check line về gần tâm (abs(err) < LINE_CENTER_THRESHOLD)
-                elif turn_state["label"] == 'turn-around':
-                    if abs(err) < 50:  # threshold có thể chỉnh
-                        turn_state["phase"] = "wait_after_cross"
-                        turn_state["stop_start_time"] = current_time
-
-            # Nếu line mất hoàn toàn, giữ prev_error để tiếp tục kiểm tra zero-cross
-            elif turn_state["label"] in ['turn-left', 'turn-right']:
-                # không reset prev_error, giữ để phát hiện zero-cross khi line xuất hiện lại
-                pass
-
-        elif turn_state["phase"] == "wait_after_cross":
-            # Dừng xe sau khi quay xong
-            line_detect_mode = 0
-            if current_time - turn_state["stop_start_time"] >= STOP_AFTER_CROSS:
-                if turn_state["label"] in ['turn-left', 'turn-right']:
-                    line_detect_mode = 1  # bật lại bám line
-                elif turn_state["label"] == 'turn-around':
-                    line_detect_mode = 0  # dừng hẳn
-                # Reset trạng thái turn
-                turn_state["phase"] = None
-                turn_state["label"] = None
-                turn_state["turn_start_time"] = None
-                turn_state["stop_start_time"] = None
-                turn_state["prev_error"] = None
-                sign_id = -1  # reset sau khi hoàn tất
-        time.sleep(0.005)  # sleep ngắn để giảm tải CPU
-
-# ======================
-# YOLO THREAD
-# ======================
+# ====================== YOLO THREAD (CẬP NHẬT LOGIC BIỂN BÁO) ======================
 def yolo_thread():
-    global sign_id, line_detect_mode, shared_yolo, turn_state
+    global sign_id, shared_yolo, current_script, mode
+
     last = 0
     while running:
         if time.time() - last < 0.1:
-            time.sleep(0.001)
             continue
 
         with frame_lock:
@@ -238,7 +220,6 @@ def yolo_thread():
                 continue
             frame = shared_frame.copy()
 
-        # ====================== YOLO INFERENCE ======================
         img, scale, px, py = preprocess_yolo(frame)
         preds = session.run(None, {input_name: img})[0][0]
 
@@ -261,51 +242,66 @@ def yolo_thread():
 
         keep = nms(boxes, scores)
 
-        if keep:
+        if keep and current_script is None:
             i = keep[0]
-            detected_id = ids[i]
-            shared_yolo = (boxes[i], detected_id)
-            label = classes[detected_id]
+            sign_id = ids[i]
+            shared_yolo = (boxes[i], sign_id)
 
-            # Nếu đang không trong quá trình turn thì cập nhật turn_state
-            if turn_state["phase"] is None:
-                if label == 'go-ahead':
-                    line_detect_mode = 1
-                    sign_id = -1
-                elif label in ['turn-left', 'turn-right', 'turn-around']:
-                    # bắt đầu quá trình turn
-                    turn_state["phase"] = "wait_before_rotate"
-                    turn_state["label"] = label
-                    turn_state["turn_start_time"] = time.time()
-                    turn_state["stop_start_time"] = None
-                    turn_state["prev_error"] = None
-                    # Dừng xe trước khi quay
-                    line_detect_mode = 0
-                    sign_id = detected_id
+            if sign_id == 0:   # go-ahead
+                mode = MODE_TURN_AHEAD
+
+            elif sign_id == 1: # stop
+                mode = MODE_STOP
+
+            elif sign_id == 2: # turn around
+                current_script = TurnScript(MODE_TURN_AROUND, final_stop=True)
+
+            elif sign_id == 3: # turn left
+                current_script = TurnScript(MODE_TURN_LEFT, final_stop=False)
+
+            elif sign_id == 4: # turn right
+                current_script = TurnScript(MODE_TURN_RIGHT, final_stop=False)
+
         else:
-            # Nếu không detect gì mới, không reset sign_id nếu đang quay
-            if turn_state["phase"] is None:
-                sign_id = -1
-                shared_yolo = None
+            shared_yolo = None
+            sign_id = -1
 
         last = time.time()
+
+
+
 
 # ======================
 # LINE THREAD
 # ======================
 def line_thread():
-    global error, shared_line
+    global error, shared_line, current_script
+
     while running:
         with frame_lock:
             if shared_frame is None:
                 continue
             frame = shared_frame.copy()
+
         err, result = detect_line(frame)
-        error = err
-        shared_line = result
+
+        if result:
+            error = err
+            shared_line = result
+        else:
+            error = 0
+            shared_line = None
+
+        if current_script:
+            current_script.update(error)
+            if not current_script.active:
+                current_script = None
+
+
+
 
 # ======================
-# DISPLAY THREAD
+# DISPLAY THREAD (ONLY DRAW HERE)
 # ======================
 def display_thread():
     global running
@@ -320,55 +316,59 @@ def display_thread():
         # Draw YOLO
         if yolo is not None:
             (x,y,w,h), sid = yolo
-            cv2.rectangle(frame,(x,y),(x+w,y+h),(255,0,0),2)
-            cv2.putText(frame, classes[sid],(x,y-5),cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,0,0),2)
+            cv2.rectangle(frame, (x,y), (x+w,y+h), (255,0,0), 2)
+            cv2.putText(frame, classes[sid], (x,y-5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,0), 2)
 
         # Draw LINE
         if line is not None:
-            cx,cy,contour=line
-            cv2.circle(frame,(cx,cy),5,(0,255,0),-1)
-            cv2.drawContours(frame,[contour],-1,(0,255,0),2)
+            cx, cy, contour = line
+            cv2.circle(frame, (cx, cy), 5, (0,255,0), -1)
+            cv2.drawContours(frame, [contour], -1, (0,255,0), 2)
 
-        # In debug
-        print(f"MODE:{line_detect_mode} ERR:{error} SIGN:{sign_id}")
 
-        cv2.imshow("Frame",frame)
-        if cv2.waitKey(1)==27:
-            running=False
+        cv2.imshow("Frame", frame)
+        if cv2.waitKey(1) == 27:
+            running = False
             break
+
     cv2.destroyAllWindows()
 
 # ======================
-# SEND THREAD
+# SEND UART THREAD
 # ======================
+# ====================== SEND THREAD ======================
 def send_thread():
-    global line_detect_mode, error, sign_id
     last = 0
     while running:
-        if time.time()-last<0.05:
+        if time.time() - last < 0.05:
             continue
-        uart.send_uart(line_detect_mode,error,sign_id)
+
+        uart.send_uart(mode, error)
+        print(f"MODE:{mode} ERR:{error} SIGN:{classes[sign_id] if sign_id!=-1 else 'none'}")
+
         last = time.time()
+
+
+
 
 # ======================
 # MAIN
 # ======================
 cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FPS, 30)
-
-cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH,640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT,480)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
 threads = [
-    threading.Thread(target=camera_thread,args=(cap,),daemon=True),
-    threading.Thread(target=yolo_thread,daemon=True),
-    threading.Thread(target=line_thread,daemon=True),
-    threading.Thread(target=display_thread,daemon=True),
-    threading.Thread(target=send_thread,daemon=True),
-    threading.Thread(target=turn_thread, daemon=True)
+    threading.Thread(target=camera_thread, args=(cap,), daemon=True),
+    threading.Thread(target=yolo_thread, daemon=True),
+    threading.Thread(target=line_thread, daemon=True),
+    threading.Thread(target=display_thread, daemon=True),
+    threading.Thread(target=send_thread, daemon=True),
 ]
 
 for t in threads: t.start()
 for t in threads: t.join()
+
 cap.release()
