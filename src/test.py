@@ -6,48 +6,6 @@ import onnxruntime as ort
 from uart_protocol import UART
 import serial
 
-
-class TurnScript:
-    def __init__(self, turn_mode, final_stop):
-        self.turn_mode = turn_mode
-        self.final_stop = final_stop
-        self.step = 0
-        self.start_time = None
-        self.active = True
-
-    def update(self, line_error):
-        global mode
-
-        # STEP 0: STOP trước khi quay
-        if self.step == 0:
-            mode = MODE_STOP
-            if self.start_time is None:
-                self.start_time = time.time()
-            elif time.time() - self.start_time >= 3:
-                self.step = 1
-                self.start_time = None
-
-        # STEP 1: QUAY
-        elif self.step == 1:
-            mode = self.turn_mode
-            if abs(line_error) < 10:   # line về tâm
-                self.step = 2
-                self.start_time = None
-
-        # STEP 2: STOP sau khi quay
-        elif self.step == 2:
-            mode = MODE_STOP
-            if self.start_time is None:
-                self.start_time = time.time()
-            elif time.time() - self.start_time >= 3:
-                if self.final_stop:
-                    self.active = False   # đứng luôn
-                else:
-                    mode = MODE_TURN_AHEAD
-                    self.active = False
-
-current_script = None
-
 # ======================
 # UART
 # ======================
@@ -56,15 +14,13 @@ ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
 uart = UART(ser, HEADER)
 
 
-MODE_TURN_AHEAD = 0   # bám line
-MODE_STOP       = 1
-MODE_TURN_AROUND= 2
-MODE_TURN_LEFT  = 3
-MODE_TURN_RIGHT = 4
+STATE_LINE_FOLLOW = 0
+STATE_TURN_LEFT   = 1
+STATE_TURN_RIGHT  = 2
+STATE_TURN_AROUND = 3
+STATE_STOP        = 4
 
-
-mode = MODE_STOP      # mặc định khi bật nguồn
-sign_id = -1          # chỉ để debug
+robot_state = STATE_LINE_FOLLOW
 
 # ======================
 # SHARED DATA
@@ -208,11 +164,12 @@ LINE_CENTER_THRESHOLD = 50  # px gần tâm ảnh để bật lại line
 
 # ====================== YOLO THREAD (CẬP NHẬT LOGIC BIỂN BÁO) ======================
 def yolo_thread():
-    global sign_id, shared_yolo, current_script, mode
-
+    global sign_id, line_detect_mode, shared_yolo
+    global turn_state, prev_error
     last = 0
     while running:
         if time.time() - last < 0.1:
+            time.sleep(0.001)
             continue
 
         with frame_lock:
@@ -220,6 +177,7 @@ def yolo_thread():
                 continue
             frame = shared_frame.copy()
 
+        # ====================== YOLO INFERENCE ======================
         img, scale, px, py = preprocess_yolo(frame)
         preds = session.run(None, {input_name: img})[0][0]
 
@@ -242,32 +200,65 @@ def yolo_thread():
 
         keep = nms(boxes, scores)
 
-        if keep and current_script is None:
+        # ====================== XỬ LÝ BIỂN BÁO ======================
+        if keep:
             i = keep[0]
             sign_id = ids[i]
             shared_yolo = (boxes[i], sign_id)
+            label = classes[sign_id]
 
-            if sign_id == 0:   # go-ahead
-                mode = MODE_TURN_AHEAD
+            if label == 'go-ahead':
+                line_detect_mode = 1
+                turn_state = {"phase": None, "label": None, "turn_start_time": None, "stop_time": None}
+                prev_error = None
 
-            elif sign_id == 1: # stop
-                mode = MODE_STOP
+            elif label in ['turn-left', 'turn-right', 'turn-around']:
+                # Nếu mới thấy biển báo quay và chưa xử lý
+                if turn_state["phase"] is None:
+                    line_detect_mode = 0
+                    turn_state["phase"] = "wait_before_rotate"
+                    turn_state["label"] = label
+                    turn_state["turn_start_time"] = time.time()
+                    prev_error = None
 
-            elif sign_id == 2: # turn around
-                current_script = TurnScript(MODE_TURN_AROUND, final_stop=True)
-
-            elif sign_id == 3: # turn left
-                current_script = TurnScript(MODE_TURN_LEFT, final_stop=False)
-
-            elif sign_id == 4: # turn right
-                current_script = TurnScript(MODE_TURN_RIGHT, final_stop=False)
+            else:
+                line_detect_mode = 0
 
         else:
-            shared_yolo = None
             sign_id = -1
+            shared_yolo = None
+
+        # ====================== TURN STATE MACHINE ======================
+        if turn_state["phase"] == "wait_before_rotate":
+            # Chờ tạm trước khi quay
+            if time.time() - turn_state["turn_start_time"] >= TURN_WAIT_TIME:
+                turn_state["phase"] = "rotating"
+
+        elif turn_state["phase"] == "rotating":
+            if shared_line is not None:
+                cx, _, _ = shared_line
+                w = frame.shape[1]
+                err = cx - w//2
+
+                if prev_error is not None:
+                    if prev_error * err < 0:  # zero-cross detected
+                        turn_state["phase"] = "wait_after_cross"
+                        turn_state["stop_time"] = time.time()
+                        if turn_state["label"] == 'turn-around':
+                            sign_id = classes.index('stop')  # dừng hẳn
+                        else:
+                            sign_id = -1
+                prev_error = err
+            # Nếu line mất, giữ prev_error để phát hiện zero-cross
+
+        elif turn_state["phase"] == "wait_after_cross":
+            # Dừng sau khi zero-cross
+            if time.time() - turn_state["stop_time"] >= STOP_AFTER_CROSS:
+                if turn_state["label"] in ['turn-left', 'turn-right']:
+                    line_detect_mode = 1  # bật lại line PID
+                turn_state["phase"] = "finished"
 
         last = time.time()
-
 
 
 
@@ -275,7 +266,7 @@ def yolo_thread():
 # LINE THREAD
 # ======================
 def line_thread():
-    global error, shared_line, current_script
+    global error, shared_line, robot_state
 
     while running:
         with frame_lock:
@@ -285,19 +276,22 @@ def line_thread():
 
         err, result = detect_line(frame)
 
-        if result:
-            error = err
-            shared_line = result
-        else:
+        if result is None:
             error = 0
             shared_line = None
+            continue
 
-        if current_script:
-            current_script.update(error)
-            if not current_script.active:
-                current_script = None
+        error = err
+        shared_line = result
 
+        # ===== KẾT THÚC QUAY =====
+        if robot_state in (STATE_TURN_LEFT, STATE_TURN_RIGHT):
+            if abs(error) < 10:
+                robot_state = STATE_LINE_FOLLOW
 
+        elif robot_state == STATE_TURN_AROUND:
+            if abs(error) < 10:
+                robot_state = STATE_STOP
 
 
 # ======================
@@ -344,12 +338,11 @@ def send_thread():
         if time.time() - last < 0.05:
             continue
 
-        uart.send_uart(mode, error)
-        print(f"MODE:{mode} ERR:{error} SIGN:{classes[sign_id] if sign_id!=-1 else 'none'}")
+        # Gửi đến ESP
+        uart.send_uart(line_detect_mode, error, sign_id)
+        print(f"MODE:{line_detect_mode} ERR:{error} SIGN:{sign_id}")
 
         last = time.time()
-
-
 
 
 # ======================
